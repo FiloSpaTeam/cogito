@@ -312,6 +312,7 @@ func TestStreamAgentCompletionEvents(t *testing.T) {
 			manager := NewAgentManager()
 			var recorder eventRecorder
 			var managerInspected atomic.Bool
+			spawned := make(chan *AgentState, 1)
 			started := make(chan AgentRunSpec, 1)
 			release := make(chan struct{})
 			injected := make(chan openai.ChatCompletionMessage, 1)
@@ -346,6 +347,7 @@ func TestStreamAgentCompletionEvents(t *testing.T) {
 			runner := &spawnAgentRunner{
 				llm: noToolMockLLM{}, manager: manager, ctx: ctx, dispatcher: dispatcher,
 				streamCB: streamCB, messageInjectionChan: injected,
+				agentSpawnCallback:      func(agent *AgentState) { spawned <- agent },
 				agentCompletionCallback: func(*AgentState) { completions.Add(1) },
 			}
 
@@ -354,10 +356,10 @@ func TestStreamAgentCompletionEvents(t *testing.T) {
 				_, _, err := runner.Run(SpawnAgentArgs{Task: "child", Background: tt.background})
 				runDone <- err
 			}()
+			registeredAgent := awaitStreamTest(t, ctx, spawned, "agent registration")
 			spec := awaitStreamTest(t, ctx, started, "dispatcher start")
-			registeredAgent, ok := manager.Get(spec.ID)
-			if !ok {
-				t.Fatalf("agent %s was not registered", spec.ID)
+			if registeredAgent.ID != spec.ID {
+				t.Fatalf("spawned agent ID = %s, dispatcher ID = %s", registeredAgent.ID, spec.ID)
 			}
 			if tt.background || tt.detach {
 				t.Cleanup(registeredAgent.Cancel)
