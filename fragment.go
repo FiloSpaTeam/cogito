@@ -288,6 +288,10 @@ type ToolChoice struct {
 	Arguments map[string]any `json:"arguments"`
 	ID        string         `json:"id"`
 	Reasoning string         `json:"reasoning"`
+	// toolCallIndex retains the provider's stream index without expanding the
+	// public ToolChoice contract. A nil index uses the choice's slice position,
+	// which is the established behavior for nonstream and caller-built choices.
+	toolCallIndex *int
 }
 
 // ToolCallDecision represents the decision made by a tool call callback

@@ -368,9 +368,12 @@ func decisionWithStreaming(ctx context.Context, llm LLM, conversation []openai.C
 		}
 
 		// Build tool calls slice in index order
+		slices.Sort(toolCallOrder)
 		var toolCalls []openai.ToolCall
+		var toolCallIndexes []int
 		for _, idx := range toolCallOrder {
 			toolCalls = append(toolCalls, *toolCallMap[idx])
+			toolCallIndexes = append(toolCallIndexes, idx)
 		}
 
 		reasoning := reasoningBuf.String()
@@ -406,7 +409,7 @@ func decisionWithStreaming(ctx context.Context, llm LLM, conversation []openai.C
 		// Process all tool calls
 		toolChoices := make([]*ToolChoice, 0, len(toolCalls))
 		allParsed := true
-		for _, toolCall := range toolCalls {
+		for i, toolCall := range toolCalls {
 			arguments := make(map[string]any)
 			if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &arguments); err != nil {
 				lastErr = err
@@ -414,9 +417,12 @@ func decisionWithStreaming(ctx context.Context, llm LLM, conversation []openai.C
 				allParsed = false
 				break
 			}
+			toolCallIndex := toolCallIndexes[i]
 			toolChoices = append(toolChoices, &ToolChoice{
-				Name:      toolCall.Function.Name,
-				Arguments: arguments,
+				Name:          toolCall.Function.Name,
+				Arguments:     arguments,
+				ID:            toolCall.ID,
+				toolCallIndex: &toolCallIndex,
 			})
 		}
 
@@ -523,6 +529,7 @@ func decision(ctx context.Context, llm LLM, conversation []openai.ChatCompletion
 			toolChoices = append(toolChoices, &ToolChoice{
 				Name:      toolCall.Function.Name,
 				Arguments: arguments,
+				ID:        toolCall.ID,
 			})
 		}
 
@@ -1087,15 +1094,19 @@ func toolSelection(llm LLM, f Fragment, tools Tools, guidelines Guidelines, tool
 				selectedTool.Name = enhancedChoice.Name
 				selectedTool.Arguments = enhancedChoice.Arguments
 				selectedTool.Reasoning = reasoning
+				selectedTool.ID = enhancedChoice.ID
+				selectedTool.toolCallIndex = enhancedChoice.toolCallIndex
 			}
 		}
 
-		// Generate ID for the tool call before creating the message
-		toolCallID := uuid.New().String()
-		selectedTool.ID = toolCallID
+		// Provider IDs correlate streamed calls and results. Generate a fallback
+		// only for providers that omitted the ID.
+		if selectedTool.ID == "" {
+			selectedTool.ID = uuid.New().String()
+		}
 
 		toolCalls = append(toolCalls, openai.ToolCall{
-			ID:   toolCallID,
+			ID:   selectedTool.ID,
 			Type: openai.ToolTypeFunction,
 			Function: openai.FunctionCall{
 				Name:      selectedTool.Name,
@@ -1830,7 +1841,11 @@ Please provide revised tool call based on this feedback.`,
 		// ask_user safety ordering can rearrange execution results.
 		toolCallIndexes := make(map[string]int, len(selectedToolResults))
 		for i, toolChoice := range selectedToolResults {
-			toolCallIndexes[toolChoice.ID] = i
+			index := i
+			if toolChoice.toolCallIndex != nil {
+				index = *toolChoice.toolCallIndex
+			}
+			toolCallIndexes[toolChoice.ID] = index
 		}
 
 		type toolExecutionResult struct {

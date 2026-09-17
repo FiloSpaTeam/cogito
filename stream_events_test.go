@@ -99,6 +99,87 @@ type eventRecorder struct {
 	events []StreamEvent
 }
 
+type streamCorrelationLLM struct {
+	streams [][]StreamEvent
+	calls   int
+}
+
+func (m *streamCorrelationLLM) Ask(context.Context, Fragment) (Fragment, error) {
+	return Fragment{}, errors.New("unexpected Ask fallback")
+}
+
+func (m *streamCorrelationLLM) CreateChatCompletion(context.Context, openai.ChatCompletionRequest) (LLMReply, LLMUsage, error) {
+	return LLMReply{}, LLMUsage{}, errors.New("unexpected nonstream completion")
+}
+
+func (m *streamCorrelationLLM) CreateChatCompletionStream(context.Context, openai.ChatCompletionRequest) (<-chan StreamEvent, error) {
+	if m.calls >= len(m.streams) {
+		return nil, fmt.Errorf("unexpected stream completion %d", m.calls+1)
+	}
+	events := m.streams[m.calls]
+	m.calls++
+	ch := make(chan StreamEvent, len(events))
+	for _, event := range events {
+		ch <- event
+	}
+	close(ch)
+	return ch, nil
+}
+
+type nonStreamCorrelationLLM struct {
+	id    string
+	calls int
+	asks  int
+}
+
+func (m *nonStreamCorrelationLLM) Ask(_ context.Context, f Fragment) (Fragment, error) {
+	m.asks++
+	return f.AddMessage(AssistantMessageRole, "done"), nil
+}
+
+func (m *nonStreamCorrelationLLM) CreateChatCompletion(context.Context, openai.ChatCompletionRequest) (LLMReply, LLMUsage, error) {
+	m.calls++
+	return LLMReply{ChatCompletionResponse: openai.ChatCompletionResponse{
+		Choices: []openai.ChatCompletionChoice{{Message: openai.ChatCompletionMessage{
+			Role: AssistantMessageRole.String(),
+			ToolCalls: []openai.ToolCall{{
+				ID:       m.id,
+				Type:     openai.ToolTypeFunction,
+				Function: openai.FunctionCall{Name: "echo", Arguments: `{"marker":"nonstream"}`},
+			}},
+		}}},
+	}}, LLMUsage{}, nil
+}
+
+type streamMarkerRunner struct{}
+
+func (streamMarkerRunner) Run(args map[string]any) (string, any, error) {
+	return fmt.Sprint(args["marker"]), nil, nil
+}
+
+func streamMarkerTool() ToolDefinitionInterface {
+	return NewToolDefinition[map[string]any](streamMarkerRunner{}, map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"marker": map[string]any{"type": "string"},
+		},
+	}, "echo", "echo")
+}
+
+func streamCorrelationTurn(id string, index int, name, args string) []StreamEvent {
+	return []StreamEvent{
+		{Type: StreamEventToolCall, ToolCallID: id, ToolCallIndex: index, ToolName: name, ToolArgs: args},
+		{Type: StreamEventDone, FinishReason: "tool_calls"},
+	}
+}
+
+func streamFinalTurn() []StreamEvent {
+	return []StreamEvent{
+		{Type: StreamEventContent, Content: "done"},
+		{Type: StreamEventDone, FinishReason: "stop"},
+	}
+}
+
 func (r *eventRecorder) record(ev StreamEvent) {
 	r.mu.Lock()
 	r.events = append(r.events, ev)
@@ -225,6 +306,125 @@ func TestStreamParallelToolResultsKeepOriginalIndexes(t *testing.T) {
 	}
 	if ev := byID[callIDs[1]]; ev.ToolName != "second" || ev.ToolResult != "second-result" || ev.ToolCallIndex != 1 {
 		t.Fatalf("wrong second call correlation: %+v", ev)
+	}
+}
+
+func TestStreamingToolResultsPreserveOutOfOrderProviderCorrelation(t *testing.T) {
+	tool := streamMarkerTool()
+	llm := &streamCorrelationLLM{streams: [][]StreamEvent{{
+		{Type: StreamEventToolCall, ToolCallID: "provider-index-1", ToolCallIndex: 1, ToolName: "echo", ToolArgs: `{"marker":"provider-`},
+		{Type: StreamEventToolCall, ToolCallIndex: 1, ToolArgs: `one"}`},
+		{Type: StreamEventToolCall, ToolCallID: "provider-index-0", ToolCallIndex: 0, ToolName: "echo", ToolArgs: `{"marker":"provider-zero"}`},
+		{Type: StreamEventDone, FinishReason: "tool_calls"},
+	}, streamFinalTurn()}}
+	var recorder eventRecorder
+
+	f, err := ExecuteTools(llm, NewEmptyFragment().AddMessage(UserMessageRole, "run"),
+		WithTools(tool), DisableSinkState, WithIterations(1), WithStreamCallback(recorder.record))
+	if err != nil {
+		t.Fatalf("ExecuteTools: %v", err)
+	}
+	if llm.calls != 2 {
+		t.Fatalf("stream completions = %d, want selection + final answer", llm.calls)
+	}
+
+	results := recorder.matching(func(ev StreamEvent) bool { return ev.Type == StreamEventToolResult })
+	if len(results) != 2 {
+		t.Fatalf("tool result events = %d, want 2: %+v", len(results), results)
+	}
+	wantIDs := []string{"provider-index-0", "provider-index-1"}
+	wantResults := []string{"provider-zero", "provider-one"}
+	for i := range results {
+		if results[i].ToolCallID != wantIDs[i] || results[i].ToolCallIndex != i || results[i].ToolResult != wantResults[i] {
+			t.Fatalf("result event %d = %+v, want id=%q index=%d result=%q", i, results[i], wantIDs[i], i, wantResults[i])
+		}
+	}
+
+	if len(f.Messages) < 4 {
+		t.Fatalf("transcript messages = %d, want at least user + assistant + 2 tools: %+v", len(f.Messages), f.Messages)
+	}
+	assistant := f.Messages[1]
+	if len(assistant.ToolCalls) != 2 {
+		t.Fatalf("assistant tool calls = %d, want 2: %+v", len(assistant.ToolCalls), assistant.ToolCalls)
+	}
+	for i := range assistant.ToolCalls {
+		if assistant.ToolCalls[i].ID != wantIDs[i] {
+			t.Fatalf("assistant tool call %d id = %q, want %q", i, assistant.ToolCalls[i].ID, wantIDs[i])
+		}
+		if f.Messages[i+2].Role != "tool" || f.Messages[i+2].ToolCallID != wantIDs[i] || f.Messages[i+2].Content != wantResults[i] {
+			t.Fatalf("tool transcript message %d = %+v, want id=%q result=%q", i, f.Messages[i+2], wantIDs[i], wantResults[i])
+		}
+	}
+}
+
+func TestStreamingToolResultGeneratesOnlyMissingIDAndKeepsSparseIndex(t *testing.T) {
+	tool := streamMarkerTool()
+	llm := &streamCorrelationLLM{streams: [][]StreamEvent{
+		streamCorrelationTurn("", 4, "echo", `{"marker":"missing-id"}`),
+		streamFinalTurn(),
+	}}
+	var recorder eventRecorder
+
+	f, err := ExecuteTools(llm, NewEmptyFragment().AddMessage(UserMessageRole, "run"),
+		WithTools(tool), DisableSinkState, WithIterations(1), WithStreamCallback(recorder.record))
+	if err != nil {
+		t.Fatalf("ExecuteTools: %v", err)
+	}
+	results := recorder.matching(func(ev StreamEvent) bool { return ev.Type == StreamEventToolResult })
+	if len(results) != 1 {
+		t.Fatalf("tool result events = %d, want 1: %+v", len(results), results)
+	}
+	generatedID := results[0].ToolCallID
+	if generatedID == "" || results[0].ToolCallIndex != 4 {
+		t.Fatalf("generated correlation = %+v, want non-empty id and index 4", results[0])
+	}
+	if f.Messages[1].ToolCalls[0].ID != generatedID || f.Messages[2].ToolCallID != generatedID || f.Status.ToolResults[0].ToolArguments.ID != generatedID {
+		t.Fatalf("generated id not shared by assistant, tool, status, and event: id=%q messages=%+v status=%+v", generatedID, f.Messages, f.Status.ToolResults)
+	}
+}
+
+func TestNonStreamingSelectionPreservesProviderIDWithNilCallback(t *testing.T) {
+	tool := streamMarkerTool()
+	llm := &nonStreamCorrelationLLM{id: "provider-nonstream"}
+
+	f, err := ExecuteTools(llm, NewEmptyFragment().AddMessage(UserMessageRole, "run"),
+		WithTools(tool), DisableSinkState, WithIterations(1), WithStreamCallback(nil))
+	if err != nil {
+		t.Fatalf("ExecuteTools: %v", err)
+	}
+	if llm.calls != 1 || llm.asks != 1 {
+		t.Fatalf("nonstream calls = completions:%d asks:%d, want 1 each", llm.calls, llm.asks)
+	}
+	if f.Messages[1].ToolCalls[0].ID != "provider-nonstream" || f.Messages[2].ToolCallID != "provider-nonstream" || f.Status.ToolResults[0].ToolArguments.ID != "provider-nonstream" {
+		t.Fatalf("provider id not preserved through nil-callback nonstream execution: messages=%+v status=%+v", f.Messages, f.Status.ToolResults)
+	}
+}
+
+func TestForcedReasoningResultUsesExecutedParameterCallCorrelation(t *testing.T) {
+	tool := streamMarkerTool()
+	llm := &streamCorrelationLLM{streams: [][]StreamEvent{
+		streamCorrelationTurn("reasoning-selection", 0, "reasoning", `{"reasoning":"use echo"}`),
+		streamCorrelationTurn("intention-selection", 0, "pick_tool", `{"tool":"echo","reasoning":"use echo"}`),
+		streamCorrelationTurn("reasoning-parameters", 0, "reasoning", `{"reasoning":"set marker"}`),
+		streamCorrelationTurn("provider-parameters", 6, "echo", `{"marker":"enhanced"}`),
+		streamFinalTurn(),
+	}}
+	var recorder eventRecorder
+
+	f, err := ExecuteTools(llm, NewEmptyFragment().AddMessage(UserMessageRole, "run"),
+		WithTools(tool), WithForceReasoning(), WithIterations(1), WithStreamCallback(recorder.record))
+	if err != nil {
+		t.Fatalf("ExecuteTools: %v", err)
+	}
+	if llm.calls != 5 {
+		t.Fatalf("stream completions = %d, want 4 selection/parameter calls + final answer", llm.calls)
+	}
+	results := recorder.matching(func(ev StreamEvent) bool { return ev.Type == StreamEventToolResult })
+	if len(results) != 1 || results[0].ToolCallID != "provider-parameters" || results[0].ToolCallIndex != 6 || results[0].ToolResult != "enhanced" {
+		t.Fatalf("forced reasoning result correlation = %+v, want executed parameter call id/index", results)
+	}
+	if f.Messages[1].ToolCalls[0].ID != "provider-parameters" || f.Messages[2].ToolCallID != "provider-parameters" {
+		t.Fatalf("forced reasoning transcript lost executed parameter call id: %+v", f.Messages)
 	}
 }
 
