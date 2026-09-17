@@ -1037,6 +1037,57 @@ if err != nil {
 }
 ```
 
+#### Approving Automatically Generated Plans
+
+`WithPlanApproval` lets an application review plans created by `EnableAutoPlan`
+before any subtask runs. The callback runs synchronously with the execution
+context, so a callback that waits for a UI decision should also wait for
+`ctx.Done()`:
+
+```go
+// decisions is an application-owned channel fed by the UI reviewing this plan.
+result, err := cogito.ExecuteTools(llm, fragment,
+    cogito.EnableAutoPlan,
+    cogito.WithTools(searchTool),
+    cogito.WithMaxAdjustmentAttempts(2),
+    cogito.WithPlanApproval(func(ctx context.Context, plan *structures.Plan, goal *structures.Goal) cogito.PlanDecision {
+        fmt.Println(goal.Goal, plan.Subtasks)
+        select {
+        case decision, ok := <-decisions:
+            if !ok {
+                return cogito.PlanDecision{}
+            }
+            return decision
+        case <-ctx.Done():
+            return cogito.PlanDecision{}
+        }
+    }),
+)
+if errors.Is(err, cogito.ErrPlanRejected) {
+    // No subtask was executed; the last message is the rejection marker.
+    fmt.Println(result.LastMessage().Content)
+}
+```
+
+Return `PlanDecision{Approved: true}` to accept the proposal, or set `Plan` as
+well to execute an edited plan. `Approved` takes precedence over `Feedback`,
+and a replacement plan must contain at least one subtask. To request another
+proposal, return a non-empty `Feedback` string. A rejected decision's `Plan`
+field is ignored. Empty or whitespace-only feedback rejects immediately.
+
+`WithMaxAdjustmentAttempts` limits re-planning attempts. The default is five,
+so the callback can see the initial proposal plus at most five revised
+proposals. Exhausting the limit, or rejecting without feedback, returns an
+error matching `ErrPlanRejected` and appends a system message containing
+`[plan rejected by user]` to the returned fragment. Passing
+`WithPlanApproval(nil)`, or omitting the option, disables the hook without
+adding model requests.
+
+The callback reviews each automatically generated plan before it enters
+`ExecutePlan`, including proposals created from approval feedback. Direct
+`ExecutePlan` calls and replans performed inside `ExecutePlan` by
+`EnableAutoPlanReEvaluator` remain caller-managed and do not invoke the hook.
+
 ### Planning with TODOs
 
 Planning with TODOs addresses context accumulation by starting each iteration with fresh context while persisting TODOs and feedback between iterations. This pattern uses separate worker and judge models: the worker executes tasks, and one or more judge LLMs review the work to determine if goal execution is completed or needs rework.
