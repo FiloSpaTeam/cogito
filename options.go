@@ -26,6 +26,7 @@ type Options struct {
 	toolReasoner                      bool
 	autoPlan                          bool
 	planReEvaluator                   bool
+	planApproval                      func(context.Context, *structures.Plan, *structures.Goal) PlanDecision
 	statusCallback, reasoningCallback func(string)
 	stepContentCallback               func(string)
 	gaps                              []string

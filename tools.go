@@ -924,6 +924,24 @@ func doPlan(llm LLM, f Fragment, tools Tools, opts ...Option) (Fragment, bool, e
 		xlog.Debug("Extracted plan subtasks", "goal", goal.Goal, "subtasks", plan.Subtasks)
 		xlog.Debug("Plan description", "description", plan.Description)
 
+		o := defaultOptions()
+		o.Apply(opts...)
+		if o.planApproval != nil {
+			plan, err = approveAutomaticPlan(llm, f, plan, goal, o, opts...)
+			if err != nil {
+				if errors.Is(err, ErrPlanRejected) {
+					rejected := f
+					rejected.Messages = slices.Clone(f.Messages)
+					rejected = rejected.AddMessage(SystemMessageRole, "[plan rejected by user]")
+					return rejected, false, fmt.Errorf("plan approval rejected: %w", err)
+				}
+				return f, false, fmt.Errorf("failed to approve plan: %w", err)
+			}
+			if err := o.context.Err(); err != nil {
+				return f, false, fmt.Errorf("failed to approve plan: %w", err)
+			}
+		}
+
 		// opts without autoplan disabled
 		f, err = ExecutePlan(llm, f, plan, goal, append(opts, func(o *Options) { o.autoPlan = false })...)
 		if err != nil {
