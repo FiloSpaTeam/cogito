@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/sashabaranov/go-openai"
 )
@@ -22,6 +23,7 @@ type streamTestRunner struct {
 	calls   int
 	started chan<- struct{}
 	waitFor <-chan struct{}
+	waitCtx context.Context
 }
 
 func (r *streamTestRunner) Run(map[string]any) (string, any, error) {
@@ -29,7 +31,14 @@ func (r *streamTestRunner) Run(map[string]any) (string, any, error) {
 		close(r.started)
 	}
 	if r.waitFor != nil {
-		<-r.waitFor
+		if r.waitCtx == nil {
+			return "", nil, errors.New("stream test runner missing wait context")
+		}
+		select {
+		case <-r.waitFor:
+		case <-r.waitCtx.Done():
+			return "", nil, fmt.Errorf("stream test runner wait: %w", r.waitCtx.Err())
+		}
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -40,6 +49,36 @@ func (r *streamTestRunner) Run(map[string]any) (string, any, error) {
 	}
 	result := r.results[i]
 	return result.result, nil, result.err
+}
+
+const streamTestTimeout = 2 * time.Second
+
+func streamTestContext(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), streamTestTimeout)
+	t.Cleanup(cancel)
+	return ctx
+}
+
+func awaitStreamTest[T any](t *testing.T, ctx context.Context, ch <-chan T, label string) T {
+	t.Helper()
+	select {
+	case value := <-ch:
+		return value
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for %s: %v", label, ctx.Err())
+		var zero T
+		return zero
+	}
+}
+
+func awaitStreamAgent(t *testing.T, ctx context.Context, agent *AgentState) {
+	t.Helper()
+	select {
+	case <-agent.done:
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for agent %s: %v", agent.ID, ctx.Err())
+	}
 }
 
 func (r *streamTestRunner) callCount() int {
@@ -147,19 +186,20 @@ func TestStreamToolResultCarriesFinalRenderedFailureAndCause(t *testing.T) {
 }
 
 func TestStreamParallelToolResultsKeepOriginalIndexes(t *testing.T) {
-	slowStarted := make(chan struct{})
-	fastReturned := make(chan struct{})
-	slow := streamTestTool("slow", &streamTestRunner{
-		results: []streamTestResult{{result: "slow-result"}}, started: slowStarted, waitFor: fastReturned,
+	ctx := streamTestContext(t)
+	firstEntered := make(chan struct{})
+	secondEntered := make(chan struct{})
+	first := streamTestTool("first", &streamTestRunner{
+		results: []streamTestResult{{result: "first-result"}}, started: firstEntered, waitFor: secondEntered, waitCtx: ctx,
 	})
-	fast := streamTestTool("fast", &streamTestRunner{
-		results: []streamTestResult{{result: "fast-result"}}, waitFor: slowStarted, started: fastReturned,
+	second := streamTestTool("second", &streamTestRunner{
+		results: []streamTestResult{{result: "second-result"}}, waitFor: firstEntered, started: secondEntered, waitCtx: ctx,
 	})
-	llm := newSequenceLLM(toolsTurn(toolCall{"slow", `{}`}, toolCall{"fast", `{}`}))
+	llm := newSequenceLLM(toolsTurn(toolCall{"first", `{}`}, toolCall{"second", `{}`}))
 	var recorder eventRecorder
 
 	f, err := ExecuteTools(llm, NewEmptyFragment().AddMessage(UserMessageRole, "run"),
-		WithTools(slow, fast), DisableSinkState, WithIterations(1), EnableParallelToolExecution, WithStreamCallback(recorder.record))
+		WithContext(ctx), WithTools(first, second), DisableSinkState, WithIterations(1), EnableParallelToolExecution, WithStreamCallback(recorder.record))
 	if err != nil {
 		t.Fatalf("ExecuteTools: %v", err)
 	}
@@ -180,11 +220,38 @@ func TestStreamParallelToolResultsKeepOriginalIndexes(t *testing.T) {
 	if len(callIDs) != 2 {
 		t.Fatalf("assistant tool calls = %v, want 2", callIDs)
 	}
-	if ev := byID[callIDs[0]]; ev.ToolName != "slow" || ev.ToolResult != "slow-result" || ev.ToolCallIndex != 0 {
+	if ev := byID[callIDs[0]]; ev.ToolName != "first" || ev.ToolResult != "first-result" || ev.ToolCallIndex != 0 {
 		t.Fatalf("wrong first call correlation: %+v", ev)
 	}
-	if ev := byID[callIDs[1]]; ev.ToolName != "fast" || ev.ToolResult != "fast-result" || ev.ToolCallIndex != 1 {
+	if ev := byID[callIDs[1]]; ev.ToolName != "second" || ev.ToolResult != "second-result" || ev.ToolCallIndex != 1 {
 		t.Fatalf("wrong second call correlation: %+v", ev)
+	}
+}
+
+func TestStreamQuestionBatchReorderingKeepsOriginalIndexes(t *testing.T) {
+	echo := streamTestTool("echo", &streamTestRunner{results: []streamTestResult{{result: "echo-result"}}})
+	llm := newSequenceLLM(toolsTurn(toolCall{"echo", `{}`}, toolCall{UserQuestionToolName, `{"question":"continue?"}`}))
+	var recorder eventRecorder
+
+	_, err := ExecuteTools(llm, NewEmptyFragment().AddMessage(UserMessageRole, "run"),
+		WithTools(echo), DisableSinkState, WithIterations(1), EnableParallelToolExecution,
+		WithUserQuestions(func(context.Context, UserQuestion) (UserAnswer, error) {
+			return UserAnswer{Text: "yes"}, nil
+		}),
+		WithStreamCallback(recorder.record),
+	)
+	if err != nil {
+		t.Fatalf("ExecuteTools: %v", err)
+	}
+	events := recorder.matching(func(ev StreamEvent) bool { return ev.Type == StreamEventToolResult })
+	if len(events) != 2 {
+		t.Fatalf("executed outcomes = %+v, want ask_user then echo", events)
+	}
+	if events[0].ToolName != UserQuestionToolName || events[0].ToolCallIndex != 1 {
+		t.Fatalf("question outcome lost original index: %+v", events[0])
+	}
+	if events[1].ToolName != "echo" || events[1].ToolCallIndex != 0 {
+		t.Fatalf("echo outcome lost original index: %+v", events[1])
 	}
 }
 
@@ -241,6 +308,7 @@ func TestStreamAgentCompletionEvents(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			ctx := streamTestContext(t)
 			manager := NewAgentManager()
 			var recorder eventRecorder
 			var managerInspected atomic.Bool
@@ -276,7 +344,7 @@ func TestStreamAgentCompletionEvents(t *testing.T) {
 				recorder.record(ev)
 			}
 			runner := &spawnAgentRunner{
-				llm: noToolMockLLM{}, manager: manager, ctx: context.Background(), dispatcher: dispatcher,
+				llm: noToolMockLLM{}, manager: manager, ctx: ctx, dispatcher: dispatcher,
 				streamCB: streamCB, messageInjectionChan: injected,
 				agentCompletionCallback: func(*AgentState) { completions.Add(1) },
 			}
@@ -286,20 +354,25 @@ func TestStreamAgentCompletionEvents(t *testing.T) {
 				_, _, err := runner.Run(SpawnAgentArgs{Task: "child", Background: tt.background})
 				runDone <- err
 			}()
-			spec := <-started
+			spec := awaitStreamTest(t, ctx, started, "dispatcher start")
+			registeredAgent, ok := manager.Get(spec.ID)
+			if !ok {
+				t.Fatalf("agent %s was not registered", spec.ID)
+			}
+			if tt.background || tt.detach {
+				t.Cleanup(registeredAgent.Cancel)
+			}
 			if tt.detach {
 				if err := manager.Detach(spec.ID); err != nil {
 					t.Fatalf("Detach: %v", err)
 				}
 				close(release)
 			}
-			if err := <-runDone; err != nil {
+			if err := awaitStreamTest(t, ctx, runDone, "spawn runner"); err != nil {
 				t.Fatalf("Run: %v", err)
 			}
-			agent, err := manager.Wait(spec.ID)
-			if err != nil {
-				t.Fatalf("Wait: %v", err)
-			}
+			awaitStreamAgent(t, ctx, registeredAgent)
+			agent := registeredAgent
 			if agent.Status != tt.wantStatus {
 				t.Fatalf("agent status = %q, want %q", agent.Status, tt.wantStatus)
 			}
@@ -360,12 +433,13 @@ func TestStreamChildToolResultsRetainTypeAndAgentID(t *testing.T) {
 			name = "background"
 		}
 		t.Run(name, func(t *testing.T) {
+			ctx := streamTestContext(t)
 			childTool := streamTestTool("echo", &streamTestRunner{results: []streamTestResult{{result: "child tool result"}}})
 			manager := NewAgentManager()
 			var recorder eventRecorder
 			runner := &spawnAgentRunner{
 				llm:         newSequenceLLM(toolTurn("echo", `{}`), replyTurn("child done")),
-				parentTools: Tools{childTool}, manager: manager, ctx: context.Background(), streamCB: recorder.record,
+				parentTools: Tools{childTool}, manager: manager, ctx: ctx, streamCB: recorder.record,
 			}
 			_, idAny, err := runner.Run(SpawnAgentArgs{Task: "use echo", Background: background})
 			if err != nil {
@@ -374,9 +448,12 @@ func TestStreamChildToolResultsRetainTypeAndAgentID(t *testing.T) {
 			var id string
 			if background {
 				id, _ = idAny.(string)
-				if _, err := manager.Wait(id); err != nil {
-					t.Fatalf("Wait: %v", err)
+				agent, ok := manager.Get(id)
+				if !ok {
+					t.Fatalf("agent %s was not registered", id)
 				}
+				t.Cleanup(agent.Cancel)
+				awaitStreamAgent(t, ctx, agent)
 			} else {
 				agents := manager.List()
 				if len(agents) != 1 {
