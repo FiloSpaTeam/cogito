@@ -145,8 +145,9 @@ type AgentState struct {
 
 // AgentManager is a thread-safe registry of background sub-agents.
 type AgentManager struct {
-	mu     sync.RWMutex
-	agents map[string]*AgentState
+	mu                   sync.RWMutex
+	agents               map[string]*AgentState
+	pendingNotifications int
 }
 
 // NewAgentManager creates a new AgentManager.
@@ -192,6 +193,29 @@ func (m *AgentManager) HasRunning() bool {
 	return false
 }
 
+// HasPendingWork reports whether an agent is running or a background-agent
+// completion is between terminal-state publication and delivery to the parent
+// loop. HasRunning retains its narrower lifecycle meaning.
+func (m *AgentManager) HasPendingWork() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.pendingNotifications > 0 {
+		return true
+	}
+	for _, a := range m.agents {
+		if a.Status == AgentStatusRunning {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *AgentManager) finishNotification() {
+	m.mu.Lock()
+	m.pendingNotifications--
+	m.mu.Unlock()
+}
+
 // Wait blocks until the agent with the given ID completes, then returns it.
 func (m *AgentManager) Wait(id string) (*AgentState, error) {
 	agent, ok := m.Get(id)
@@ -224,17 +248,21 @@ func (m *AgentManager) Inject(id, message string) error {
 // error if the agent is unknown or not detachable (already-background agents
 // carry a nil detach channel).
 func (m *AgentManager) Detach(id string) error {
-	m.mu.RLock()
+	m.mu.Lock()
 	a, ok := m.agents[id]
-	m.mu.RUnlock()
 	if !ok {
+		m.mu.Unlock()
 		return fmt.Errorf("agent %s not found", id)
 	}
 	if a.detach == nil {
+		m.mu.Unlock()
 		return fmt.Errorf("agent %s is not detachable", id)
 	}
+	a.Background = true
+	detach := a.detach
+	m.mu.Unlock()
 	select {
-	case a.detach <- struct{}{}:
+	case detach <- struct{}{}:
 	default:
 	}
 	return nil
@@ -615,6 +643,10 @@ func (r *spawnAgentRunner) runAgent(agent *AgentState, llm LLM, frag Fragment, o
 	completionEvent.AgentStatus = agent.Status
 	completionEvent.Content = agent.Result
 	completionEvent.Error = agent.Error
+	backgroundNotification := agent.Background && r.messageInjectionChan != nil
+	if backgroundNotification {
+		r.manager.pendingNotifications++
+	}
 	r.manager.mu.Unlock()
 
 	if r.streamCB != nil {
@@ -629,15 +661,23 @@ func (r *spawnAgentRunner) runAgent(agent *AgentState, llm LLM, frag Fragment, o
 	// Inject completion notification into parent's loop. The content is built
 	// by formatAgentCompletion so an embedder can override it via
 	// WithAgentCompletionFormatter (see helper docs).
-	if r.messageInjectionChan != nil {
+	if backgroundNotification {
 		content := formatAgentCompletion(agent, r.completionFormatter)
 		select {
 		case r.messageInjectionChan <- openai.ChatCompletionMessage{
 			Role:    "user",
 			Content: content,
 		}:
+		case <-r.ctx.Done():
+		}
+		r.manager.finishNotification()
+	} else if r.messageInjectionChan != nil {
+		// Preserve the historical best-effort foreground notification without
+		// allowing an inline foreground spawn to deadlock on its own parent.
+		content := formatAgentCompletion(agent, r.completionFormatter)
+		select {
+		case r.messageInjectionChan <- openai.ChatCompletionMessage{Role: "user", Content: content}:
 		default:
-			// Non-blocking: if the channel is full or closed, skip notification.
 		}
 	}
 }

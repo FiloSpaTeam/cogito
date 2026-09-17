@@ -54,6 +54,40 @@ type Fragment struct {
 	PendingNativeParts []NativePart // transient: audio/video for the current turn (send-once)
 }
 
+// snapshotMessages returns a Fragment value whose message graph is owned by
+// the caller. Other Fragment fields retain their ordinary value semantics; the
+// park snapshot contract only promises isolation for Messages.
+func (f Fragment) snapshotMessages() Fragment {
+	snapshot := f
+	snapshot.Messages = make([]openai.ChatCompletionMessage, len(f.Messages))
+	for i, message := range f.Messages {
+		snapshot.Messages[i] = message
+		if message.MultiContent != nil {
+			snapshot.Messages[i].MultiContent = append([]openai.ChatMessagePart(nil), message.MultiContent...)
+			for j, part := range message.MultiContent {
+				if part.ImageURL != nil {
+					imageURL := *part.ImageURL
+					snapshot.Messages[i].MultiContent[j].ImageURL = &imageURL
+				}
+			}
+		}
+		if message.FunctionCall != nil {
+			functionCall := *message.FunctionCall
+			snapshot.Messages[i].FunctionCall = &functionCall
+		}
+		if message.ToolCalls != nil {
+			snapshot.Messages[i].ToolCalls = append([]openai.ToolCall(nil), message.ToolCalls...)
+			for j, toolCall := range message.ToolCalls {
+				if toolCall.Index != nil {
+					index := *toolCall.Index
+					snapshot.Messages[i].ToolCalls[j].Index = &index
+				}
+			}
+		}
+	}
+	return snapshot
+}
+
 // Messages returns the chat completion messages from this fragment,
 // automatically prepending a force-text-reply system message if tool calls are detected.
 // This ensures LLMs provide natural language responses instead of JSON tool syntax

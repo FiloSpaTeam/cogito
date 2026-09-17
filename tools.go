@@ -1385,6 +1385,55 @@ func ExecuteTools(llm LLM, f Fragment, opts ...Option) (result Fragment, retErr 
 
 	var hasSinkState bool
 
+	injectMessage := func(msg openai.ChatCompletionMessage) {
+		position := len(f.Messages)
+		f = f.AddMessage(MessageRole(msg.Role), msg.Content)
+		xlog.Debug("Injected message at position", "position", position, "role", msg.Role)
+		if o.messageInjectionResultChan != nil {
+			select {
+			case o.messageInjectionResultChan <- MessageInjectionResult{Count: 1, Position: position}:
+			default:
+				xlog.Debug("Could not send injection result feedback (channel full or nil)")
+			}
+		}
+		f.Status.InjectedMessages = append(f.Status.InjectedMessages, InjectedMessage{
+			Message:   msg,
+			Iteration: totalIterations,
+		})
+	}
+
+	consumeQueuedInjection := func() bool {
+		select {
+		case msg, ok := <-o.messageInjectionChan:
+			if ok {
+				injectMessage(msg)
+				return true
+			}
+		default:
+		}
+		return false
+	}
+
+	hasPendingWork := func() bool {
+		if o.agentManager != nil && o.agentManager.HasPendingWork() {
+			return true
+		}
+		return o.pendingWork != nil && o.pendingWork()
+	}
+
+	finalResponsePrepared := false
+	prepareFinalResponse := func() {
+		if finalResponsePrepared {
+			return
+		}
+		finalResponsePrepared = true
+		if o.onBeforeFinalResponse != nil {
+			o.onBeforeFinalResponse()
+		}
+		for consumeQueuedInjection() {
+		}
+	}
+
 TOOL_LOOP:
 	for {
 		// Check context cancellation and handle message injection via select
@@ -1397,27 +1446,7 @@ TOOL_LOOP:
 				// Channel closed, continue normal loop
 				xlog.Debug("Message injection channel closed")
 			} else {
-				// Inject the message at current position
-				position := len(f.Messages)
-				f = f.AddMessage(MessageRole(msg.Role), msg.Content)
-				xlog.Debug("Injected message at position", "position", position, "role", msg.Role)
-
-				// Send result feedback
-				if o.messageInjectionResultChan != nil {
-					select {
-					case o.messageInjectionResultChan <- MessageInjectionResult{Count: 1, Position: position}:
-					default:
-						// Non-blocking send, drop if channel is full
-						xlog.Debug("Could not send injection result feedback (channel full or nil)")
-					}
-				}
-
-				// Track injected message
-				f.Status.InjectedMessages = append(f.Status.InjectedMessages, InjectedMessage{
-					Message:   msg,
-					Iteration: totalIterations,
-				})
-
+				injectMessage(msg)
 				// Don't process loop body, loop again to handle next injection or proceed
 				continue
 			}
@@ -1432,6 +1461,7 @@ TOOL_LOOP:
 			if o.statusCallback != nil {
 				o.statusCallback("Max total iterations reached, stopping execution")
 			}
+			prepareFinalResponse()
 
 			// Compact before final Ask if threshold exceeded (we would not reach compaction check in next iteration)
 			if o.compactionThreshold > 0 {
@@ -1561,13 +1591,23 @@ TOOL_LOOP:
 				if o.statusCallback != nil && reasoning == "" {
 					o.statusCallback("No tool was selected")
 				}
+				// Read pending state before the queue. A background publisher clears
+				// its pending flag only after enqueueing, so a false pending result
+				// guarantees its message is visible to the following receive.
+				pending := hasPendingWork()
+				if consumeQueuedInjection() {
+					continue TOOL_LOOP
+				}
 				// If background agents are still running, block until a completion message arrives
-				if (o.agentManager != nil && o.agentManager.HasRunning()) || (o.pendingWork != nil && o.pendingWork()) {
+				if pending {
 					xlog.Debug("No tool selected but background agents still running, blocking for completions")
 					if o.onPark != nil {
 						// reasoning holds the no-tool text reply recorded in the
 						// fragment above — the parked reply the embedder surfaces.
 						o.onPark(reasoning)
+					}
+					if o.onParkSnapshot != nil {
+						o.onParkSnapshot(f.snapshotMessages(), reasoning)
 					}
 					select {
 					case <-o.context.Done():
@@ -1577,19 +1617,7 @@ TOOL_LOOP:
 							if o.onResume != nil {
 								o.onResume()
 							}
-							position := len(f.Messages)
-							f = f.AddMessage(MessageRole(msg.Role), msg.Content)
-							xlog.Debug("Injected background completion message", "position", position)
-							if o.messageInjectionResultChan != nil {
-								select {
-								case o.messageInjectionResultChan <- MessageInjectionResult{Count: 1, Position: position}:
-								default:
-								}
-							}
-							f.Status.InjectedMessages = append(f.Status.InjectedMessages, InjectedMessage{
-								Message:   msg,
-								Iteration: totalIterations,
-							})
+							injectMessage(msg)
 						}
 					}
 					continue TOOL_LOOP
@@ -1675,14 +1703,22 @@ TOOL_LOOP:
 
 		// If no tools to execute and sink state was found, stop here
 		if len(toolsToExecute) == 0 && hasSinkState {
+			pending := hasPendingWork()
+			if consumeQueuedInjection() {
+				hasSinkState = false
+				continue TOOL_LOOP
+			}
 			// If background agents are still running, block until a completion message arrives
-			if (o.agentManager != nil && o.agentManager.HasRunning()) || (o.pendingWork != nil && o.pendingWork()) {
+			if pending {
 				xlog.Debug("Sink state selected but background agents still running, blocking for completions")
 				hasSinkState = false // Reset so we re-enter the loop
 				if o.onPark != nil {
 					// Sink-state park: the reply is produced by the sink state
 					// after the loop, so there is no parked reply text yet.
 					o.onPark("")
+				}
+				if o.onParkSnapshot != nil {
+					o.onParkSnapshot(f.snapshotMessages(), "")
 				}
 				select {
 				case <-o.context.Done():
@@ -1692,19 +1728,7 @@ TOOL_LOOP:
 						if o.onResume != nil {
 							o.onResume()
 						}
-						position := len(f.Messages)
-						f = f.AddMessage(MessageRole(msg.Role), msg.Content)
-						xlog.Debug("Injected background completion message", "position", position)
-						if o.messageInjectionResultChan != nil {
-							select {
-							case o.messageInjectionResultChan <- MessageInjectionResult{Count: 1, Position: position}:
-							default:
-							}
-						}
-						f.Status.InjectedMessages = append(f.Status.InjectedMessages, InjectedMessage{
-							Message:   msg,
-							Iteration: totalIterations,
-						})
+						injectMessage(msg)
 					}
 				}
 				continue TOOL_LOOP
@@ -2027,6 +2051,7 @@ Please provide revised tool call based on this feedback.`,
 	// If sink state was found, stop execution after processing all tools
 	if hasSinkState {
 		xlog.Debug("Sink state was found, stopping execution after processing tools")
+		prepareFinalResponse()
 		status := f.Status
 		var err error
 		f, err = askWithStreaming(o.context, llm, f, o.streamCallback)

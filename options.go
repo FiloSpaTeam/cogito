@@ -71,8 +71,12 @@ type Options struct {
 	// reply text that preceded the park ("" when the model produced none).
 	// onResume, when set, fires immediately after an injected message wakes
 	// the loop at a park gate.
-	onPark   func(reply string)
-	onResume func()
+	onPark         func(reply string)
+	onParkSnapshot func(Fragment, string)
+	onResume       func()
+	// onBeforeFinalResponse fires before this loop's terminal final-response
+	// request. It is intentionally not propagated to spawned sub-agents.
+	onBeforeFinalResponse func()
 
 	// TODO-based iterative execution options
 	reviewerLLMs        []LLM
@@ -483,6 +487,18 @@ func WithPendingWork(fn func() bool) Option { return func(o *Options) { o.pendin
 // injected messages), so onPark may fire multiple times — that is expected.
 func WithOnPark(fn func(reply string)) Option { return func(o *Options) { o.onPark = fn } }
 
+// WithOnParkSnapshot registers a callback fired at the same park gates as
+// WithOnPark. It receives an owned snapshot of the fragment's messages and the
+// parked assistant reply. The no-tool reply is included in the snapshot before
+// this callback runs. Mutating the snapshot's messages does not affect the live
+// execution fragment.
+//
+// When both callbacks are configured, WithOnPark runs first for backward
+// compatibility, followed by WithOnParkSnapshot.
+func WithOnParkSnapshot(fn func(Fragment, string)) Option {
+	return func(o *Options) { o.onParkSnapshot = fn }
+}
+
 // WithOnResume registers a callback fired immediately AFTER an injected message
 // wakes the loop at a park gate (the resume path). It does NOT fire when the
 // loop unblocks because the injection channel was closed or the context was
@@ -492,6 +508,21 @@ func WithOnPark(fn func(reply string)) Option { return func(o *Options) { o.onPa
 // Across a single run the loop may park and resume multiple times (e.g. several
 // injected messages), so onResume may fire multiple times — that is expected.
 func WithOnResume(fn func()) Option { return func(o *Options) { o.onResume = fn } }
+
+// WithOnBeforeFinalResponse registers a callback fired once immediately before
+// ExecuteTools prepares a terminal final-response request, whether execution
+// reached its iteration limit or selected the sink state. ExecuteTools waits
+// for the callback to return, then drains all currently queued message
+// injections into the fragment before asking the model for the final response.
+//
+// Hosts with live message admission should use the callback to synchronously
+// close admission and wait for already accepted senders. Once it returns, no
+// accepted sender may enqueue another message; this makes the following drain
+// an atomic terminal boundary. The callback is scoped to this ExecuteTools call
+// and is not inherited by spawned sub-agents.
+func WithOnBeforeFinalResponse(fn func()) Option {
+	return func(o *Options) { o.onBeforeFinalResponse = fn }
+}
 
 // WithUserQuestions injects the built-in ask_user tool so the model can ask
 // the user a structured question (text, optional short options, optional free
