@@ -639,15 +639,16 @@ Cogito supports spawning sub-agents via tools, allowing the LLM to delegate task
 ```go
 result, err := cogito.ExecuteTools(llm, fragment,
     cogito.WithTools(searchTool, weatherTool),
-    cogito.EnableAgentSpawning, // Adds spawn_agent, check_agent, get_agent_result tools
+    cogito.EnableAgentSpawning, // Adds all four agent-management tools
     cogito.WithIterations(10),
 )
 ```
 
-When enabled, three built-in tools are injected:
+When enabled, four built-in tools are injected:
 - **`spawn_agent`** — Spawns a sub-agent with a task. Set `background: true` for non-blocking execution.
 - **`check_agent`** — Checks the status of a background agent by ID.
 - **`get_agent_result`** — Retrieves the result of a background agent. Set `wait: true` to block until done.
+- **`send_agent_message`** — Injects a message into a running child, or resumes a completed child from its saved fragment.
 
 **Foreground Agents (Blocking):**
 
@@ -664,6 +665,20 @@ result, err := cogito.ExecuteTools(llm, fragment,
     cogito.WithIterations(5),
 )
 ```
+
+When the parent has no tool to call but a background child is still running, it
+parks on the message-injection channel. `WithOnPark` runs immediately before
+that wait and receives the parent's current text reply; `WithOnResume` runs
+after the next injected user or completion message wakes the loop. Both
+callbacks can run more than once. Keep them short and use them to hand events
+to your UI rather than waiting for the agent to finish inside the callback.
+
+Pass a buffered `WithMessageInjectionChan` when the application needs to own
+the channel. Keep it open until `ExecuteTools` has returned and every detached
+or background job that can send to it has stopped. Cancel and join those jobs
+before releasing the channel; do not close a channel while Cogito may still
+publish a completion to it. `WithPendingWork` applies the same park/resume
+behavior to application-owned background work.
 
 **Background Agents (Non-Blocking):**
 
@@ -752,14 +767,28 @@ By default, sub-agents receive all parent tools except the agent management tool
 // → Sub-agent only has access to the "search" tool
 ```
 
-To allow sub-agents to also spawn their own sub-agents, the LLM can explicitly include agent tools:
-```go
-// spawn_agent(task="Complex task", tools=["search", "spawn_agent", "check_agent", "get_agent_result"])
-```
+Named types registered with `WithAgentDefinitions` can set `AgentDefinition.Tools`
+as their default allow-list. A non-empty `spawn_agent.tools` list takes
+precedence over the definition; an empty list falls back to the definition and
+then to all parent tools. The resolved names are also carried in
+`AgentRunSpec.Tools` for dispatchers. A completed child resumed with
+`send_agent_message` keeps its saved conversation and question capability, but
+ordinary tools from its original spawn are currently not restored.
+
+**External Dispatch:**
+
+`WithAgentDispatcher` receives an `AgentRunSpec` and can execute the child in a
+worker process or another service. Cogito still owns registration, status,
+callbacks, foreground detach, and background completion injection. Return a
+final `Fragment`; return `ErrDispatchFallback` when that particular run should
+fall back to Cogito's normal in-process execution. A dispatched child does not
+inherit in-process tools or `ask_user`; the dispatcher must provide any remote
+capabilities it needs.
 
 **Streaming Sub-Agent Events:**
 
-When streaming is enabled, sub-agent events are tagged with a `StreamEventSubAgent` type and include the agent's ID:
+When streaming is enabled, sub-agent events are tagged with a
+`StreamEventSubAgent` type and include the agent's ID:
 
 ```go
 result, err := cogito.ExecuteTools(llm, fragment,
@@ -775,6 +804,20 @@ result, err := cogito.ExecuteTools(llm, fragment,
     cogito.WithIterations(5),
 )
 ```
+
+Progress events have an empty `AgentStatus`. Each spawned run emits one
+terminal sub-agent event carrying `AgentStatusCompleted` or `AgentStatusFailed`,
+the final content, finish reason, and any error. Treat that status as the
+authoritative lifecycle transition rather than inferring completion from a
+progress message.
+
+Every logical tool execution emits one `StreamEventToolResult` after retries
+finish. It includes the final result, tool-call ID and index, error, and child
+agent ID when applicable. `WithToolCallResultCallback` is still invoked for the
+same execution, so applications that deduplicate should subscribe to one result
+surface or key both surfaces by tool-call ID. Stream, spawn, completion, and
+tool-result callbacks may arrive concurrently; callbacks must be thread-safe
+and must not block waiting for a terminal agent event or `AgentManager.Wait`.
 
 **When to Use Sub-Agents:**
 
@@ -875,6 +918,10 @@ func (t *CustomTool) Execute(args map[string]any) (string, error) {
 ```
 
 ### Asking the User (Human in the Loop)
+
+The runnable [interactive example](examples/interactive) combines structured
+questions, automatic plan approval, and background park/resume without a
+network client.
 
 When a task is ambiguous, the model can ask the user a structured question instead of guessing. `WithUserQuestions` injects a built-in `ask_user` tool. The tool call **blocks inside the agent loop** until the handler returns, and the answer becomes the tool result: the model sees a normal `tool_call → tool_result` pair, so a question costs no extra model call and the loop keeps its state (plan, tools called, sub-agents in flight).
 
@@ -1091,6 +1138,9 @@ if err != nil {
 ```
 
 #### Approving Automatically Generated Plans
+
+The runnable [interactive example](examples/interactive) accepts approval,
+rejection, edits, and feedback-driven re-planning from stdin.
 
 `WithPlanApproval` lets an application review plans created by `EnableAutoPlan`
 before any subtask runs. The callback runs synchronously with the execution
