@@ -702,6 +702,9 @@ func convertOptionsToFunctions(o *Options) []Option {
 	if o.reasoningCallback != nil {
 		opts = append(opts, WithReasoningCallback(o.reasoningCallback))
 	}
+	if o.streamCallback != nil {
+		opts = append(opts, WithStreamCallback(o.streamCallback))
+	}
 	if o.feedbackCallback != nil {
 		opts = append(opts, WithFeedbackCallback(o.feedbackCallback))
 	}

@@ -559,7 +559,9 @@ func (r *spawnAgentRunner) Run(args SpawnAgentArgs) (string, any, error) {
 		parentCB := r.streamCB
 		bgOpts = append(bgOpts, WithStreamCallback(func(ev StreamEvent) {
 			ev.AgentID = agentID
-			ev.Type = StreamEventSubAgent
+			if ev.Type != StreamEventToolResult {
+				ev.Type = StreamEventSubAgent
+			}
 			parentCB(ev)
 		}))
 	}
@@ -595,17 +597,29 @@ func (r *spawnAgentRunner) runAgent(agent *AgentState, llm LLM, frag Fragment, o
 		result, err = ExecuteTools(llm, frag, opts...)
 	}
 
+	completionEvent := StreamEvent{Type: StreamEventSubAgent, AgentID: agent.ID}
 	r.manager.mu.Lock()
 	if err != nil {
 		agent.Status = AgentStatusFailed
 		agent.Error = err
 		agent.Result = fmt.Sprintf("Failed: %v", err)
+		completionEvent.FinishReason = "error"
 	} else {
 		agent.Status = AgentStatusCompleted
-		agent.Result = result.LastMessage().Content
+		if lastMessage := result.LastMessage(); lastMessage != nil {
+			agent.Result = lastMessage.Content
+		}
 		agent.Fragment = &result
+		completionEvent.FinishReason = "stop"
 	}
+	completionEvent.AgentStatus = agent.Status
+	completionEvent.Content = agent.Result
+	completionEvent.Error = agent.Error
 	r.manager.mu.Unlock()
+
+	if r.streamCB != nil {
+		r.streamCB(completionEvent)
+	}
 
 	// Fire completion callback.
 	if r.agentCompletionCallback != nil {

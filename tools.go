@@ -1264,6 +1264,9 @@ func prepareAgentTools(o *Options, llm LLM) []ToolDefinitionInterface {
 	if o.userQuestionHandler != nil {
 		subAgentOpts = append(subAgentOpts, WithUserQuestions(o.userQuestionHandler))
 	}
+	if o.streamCallback != nil {
+		subAgentOpts = append(subAgentOpts, WithStreamCallback(o.streamCallback))
+	}
 
 	return []ToolDefinitionInterface{
 		newSpawnAgentTool(agentLLM, o.tools, o.agentManager, o.context, subAgentOpts, o.streamCallback, o.messageInjectionChan, o.agentCompletionCallback, o.agentSpawnCallback, o.agentCompletionFormatter, o.agentDefinitions, o.agentLLMFactory, o.agentDispatcher),
@@ -1823,6 +1826,13 @@ Please provide revised tool call based on this feedback.`,
 		}
 
 		// Execute tools (parallel or sequential)
+		// Preserve the model-selected order before parallel collection or the
+		// ask_user safety ordering can rearrange execution results.
+		toolCallIndexes := make(map[string]int, len(selectedToolResults))
+		for i, toolChoice := range selectedToolResults {
+			toolCallIndexes[toolChoice.ID] = i
+		}
+
 		type toolExecutionResult struct {
 			toolChoice *ToolChoice
 			result     string
@@ -1976,6 +1986,17 @@ Please provide revised tool call based on this feedback.`,
 				f.Status.PastActions = append(f.Status.PastActions, execResult.status) // Track for loop detection
 			}
 			f.Status.ToolResults = append(f.Status.ToolResults, execResult.status)
+			if o.streamCallback != nil && execResult.status.Executed {
+				o.streamCallback(StreamEvent{
+					Type:          StreamEventToolResult,
+					ToolName:      execResult.toolChoice.Name,
+					ToolCallID:    execResult.toolChoice.ID,
+					ToolCallIndex: toolCallIndexes[execResult.toolChoice.ID],
+					ToolResult:    execResult.result,
+					Error:         execResult.err,
+					AgentID:       o.agentID,
+				})
+			}
 
 			if o.toolCallResultCallback != nil {
 				o.toolCallResultCallback(execResult.status)
